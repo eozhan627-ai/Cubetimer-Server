@@ -16,6 +16,25 @@ const K_FACTOR = 32;
 const RATING_FLOOR = 100;
 const MATCH_KEEP_MS = 10 * 60 * 1000; // so lange kann ein Match noch gemeldet werden
 
+// --- Anti-Cheat-Einstellungen ---
+const ONLINE_CATEGORIES = ['3×3']; // Kategorien, in denen online gespielt werden darf
+const SOLO_CATEGORIES = new Set([
+  '2×2', '2×2 One-Handed', '2×2 Blindfolded',
+  '3×3', '3×3 One-Handed', '3×3 Blindfolded',
+  '4×4', '5×5', '6×6', '7×7', '8×8', '9×9', '10×10', '11×11', '12×12', '13×13', '21×21',
+]);
+const MIN_SOLO_SOLVES = 20; // gültige Solo-Solves pro Kategorie, bevor man online spielen darf
+const MIN_SOLO_GAP_MS = 10 * 1000; // Mindestabstand zwischen zwei zählenden Solo-Solves
+const MIN_SOLO_MS = 500;
+const MAX_SOLO_MS = 60 * 60 * 1000;
+const MIN_ONLINE_MS = 1500; // schneller kann kein Mensch einen gemischten Cube lösen -> auffällig
+const PLAUSIBILITY_FACTOR = 0.5; // Online-Zeit unter 50 % des Solo-Medians -> auffällig
+const PLAUSIBILITY_TRUST_PENALTY = 15;
+const REPORT_WINDOW_MIN = 30; // Zeitfenster für die Häufungsprüfung
+const REPORT_CLUSTER = 3; // so viele verschiedene, glaubwürdige Melder im Fenster -> vorläufige Sperre
+const BAN_HOURS = 24;
+const REPORT_REASONS = new Set(['no_stop', 'instant_stop', 'other']);
+
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const safeEqual = (a, b) =>
   crypto.timingSafeEqual(
@@ -37,6 +56,39 @@ app.use(express.json());
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
+// --- Auth für normale HTTP-Requests: Header x-user-id + x-auth-token ---
+async function requireAuth(req, res, next) {
+  const userId = req.get('x-user-id');
+  const token = req.get('x-auth-token');
+  if (!isUuid(userId) || !token) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id FROM users WHERE id = $1 AND auth_token_hash = $2`,
+      [userId, hashToken(token)]
+    );
+    if (rows.length === 0) return res.status(401).json({ error: 'unauthorized' });
+    req.userId = rows[0].id;
+    next();
+  } catch (err) {
+    console.error('HTTP-Auth fehlgeschlagen:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+}
+
+// Zählt Solo-Solves, die mindestens MIN_SOLO_GAP_MS nach dem vorherigen liegen
+async function countValidSolo(userId, category) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS n FROM (
+       SELECT solved_at - LAG(solved_at) OVER (ORDER BY solved_at) AS gap
+         FROM solves
+        WHERE user_id = $1 AND category = $2 AND NOT is_online
+     ) t
+     WHERE gap IS NULL OR gap >= make_interval(secs => $3)`,
+    [userId, category, MIN_SOLO_GAP_MS / 1000]
+  );
+  return rows[0].n;
+}
+
 // --- Anonyme Konten: Gerät registriert sich einmal, bekommt userId + geheimen Token ---
 app.post('/register', async (req, res) => {
   const username = String(req.body?.username ?? '').trim();
@@ -53,6 +105,51 @@ app.post('/register', async (req, res) => {
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'username_taken' });
     console.error('Registrierung fehlgeschlagen:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// --- Solo-Solve hochladen (Vergleichsbasis für die Plausibilitätsprüfung) ---
+app.post('/solves', requireAuth, async (req, res) => {
+  const { category, timeMs, solvedAt } = req.body ?? {};
+  if (
+    !SOLO_CATEGORIES.has(category) ||
+    !Number.isInteger(timeMs) || timeMs < MIN_SOLO_MS || timeMs > MAX_SOLO_MS ||
+    !Number.isInteger(solvedAt)
+  ) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+  const now = Date.now();
+  if (solvedAt > now + 60 * 1000 || solvedAt < now - 30 * 24 * 3600 * 1000) {
+    return res.status(400).json({ error: 'bad_time' });
+  }
+  try {
+    await pool.query(
+      `INSERT INTO solves (user_id, category, time_ms, is_online, solved_at)
+       VALUES ($1, $2, $3, FALSE, to_timestamp($4::double precision / 1000))
+       ON CONFLICT (user_id, category, solved_at) WHERE NOT is_online DO NOTHING`,
+      [req.userId, category, timeMs, solvedAt]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Solo-Solve konnte nicht gespeichert werden:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// --- Darf der Spieler online spielen? (für die Anzeige "12/20") ---
+app.get('/eligibility', requireAuth, async (req, res) => {
+  const category = String(req.query.category ?? '');
+  if (!ONLINE_CATEGORIES.includes(category)) return res.status(400).json({ error: 'bad_category' });
+  try {
+    const have = await countValidSolo(req.userId, category);
+    const { rows } = await pool.query(
+      `SELECT (online_banned_until IS NOT NULL AND online_banned_until > now()) AS banned FROM users WHERE id = $1`,
+      [req.userId]
+    );
+    res.json({ have, need: MIN_SOLO_SOLVES, banned: rows[0]?.banned ?? false });
+  } catch (err) {
+    console.error('Eligibility fehlgeschlagen:', err);
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -169,14 +266,60 @@ io.use(async (socket, next) => {
   }
 });
 
+// Mehrere glaubwürdige Melder in kurzer Zeit -> Spieler wird vorläufig vom Online-Spiel ausgeschlossen.
+// Der Trust-Score-Abzug kommt erst, wenn du den Report per Admin-Endpoint bestätigst.
+async function checkReportCluster(reportedId) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(DISTINCT r.reporter_id)::int AS n
+       FROM reports r
+       JOIN users u ON u.id = r.reporter_id
+      WHERE r.reported_id = $1
+        AND r.status <> 'reviewed_invalid'
+        AND r.created_at > now() - make_interval(mins => $2)
+        AND u.trust_score >= 50
+        AND u.created_at < now() - interval '1 day'`,
+    [reportedId, REPORT_WINDOW_MIN]
+  );
+  if (rows[0].n >= REPORT_CLUSTER) {
+    await pool.query(
+      `UPDATE users SET online_banned_until = now() + make_interval(hours => $2)
+        WHERE id = $1 AND (online_banned_until IS NULL OR online_banned_until < now())`,
+      [reportedId, BAN_HOURS]
+    );
+    removeFromQueues(reportedId);
+  }
+}
+
 io.on('connection', (socket) => {
   // --- Matchmaking: Rating kommt aus der DB, nicht vom Client ---
   socket.on('queue:join', async ({ category } = {}) => {
     if (typeof category !== 'string' || category.length === 0 || category.length > 40) return;
     const userId = socket.data.userId;
+
+    if (!ONLINE_CATEGORIES.includes(category)) {
+      socket.emit('queue:denied', { reason: 'category_unavailable' });
+      return;
+    }
+
     try {
-      const { rows } = await pool.query(`SELECT username, rating FROM users WHERE id = $1`, [userId]);
+      const { rows } = await pool.query(
+        `SELECT username, rating, online_banned_until FROM users WHERE id = $1`,
+        [userId]
+      );
       if (rows.length === 0) return;
+
+      const until = rows[0].online_banned_until;
+      if (until && new Date(until) > new Date()) {
+        socket.emit('queue:denied', { reason: 'banned', until });
+        return;
+      }
+
+      const have = await countValidSolo(userId, category);
+      if (have < MIN_SOLO_SOLVES) {
+        socket.emit('queue:denied', { reason: 'not_enough_solves', have, need: MIN_SOLO_SOLVES });
+        return;
+      }
+
       joinQueue({
         socketId: socket.id,
         userId,
@@ -191,7 +334,7 @@ io.on('connection', (socket) => {
 
   socket.on('queue:leave', () => removeFromQueues(socket.data.userId));
 
-  // --- Kamera-Bereitschaft ---
+  // --- Bereitschaft ---
   socket.on('match:camera-ready', ({ matchId } = {}) => {
     const match = activeMatches.get(matchId);
     if (!match || match.finished) return;
@@ -233,7 +376,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- WebRTC-Signaling (für Phase 2) ---
+  // --- WebRTC-Signaling (für Phase 2, aktuell ungenutzt) ---
   socket.on('webrtc:signal', ({ matchId, targetUserId, data } = {}) => {
     const match = activeMatches.get(matchId);
     if (!match || !match.players[socket.data.userId]) return;
@@ -243,10 +386,11 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Report ---
-  socket.on('match:report', async ({ matchId, reason } = {}) => {
+  // --- Report: nur nach beendetem Match, mit Begründung ---
+  socket.on('match:report', async ({ matchId, reasonCode, text } = {}) => {
     const match = activeMatches.get(matchId);
-    if (!match) return;
+    if (!match || !match.finished) return;
+    if (!REPORT_REASONS.has(reasonCode)) return;
     const reporterId = socket.data.userId;
     if (!match.players[reporterId]) return;
     const reportedId = Object.keys(match.players).find((id) => id !== reporterId);
@@ -254,13 +398,13 @@ io.on('connection', (socket) => {
 
     try {
       await pool.query(
-        `INSERT INTO reports (match_id, reporter_id, reported_id, reason)
-         VALUES ($1, $2, $3, $4)
+        `INSERT INTO reports (match_id, reporter_id, reported_id, reason_code, reason)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (match_id, reporter_id) DO NOTHING`,
-        [matchId, reporterId, reportedId, String(reason ?? '').slice(0, 200) || null]
+        [matchId, reporterId, reportedId, reasonCode, String(text ?? '').trim().slice(0, 200) || null]
       );
-      match.reported = true; // Client weiß dadurch: Video hochladen statt verwerfen
       socket.emit('match:report-received', { matchId });
+      await checkReportCluster(reportedId);
     } catch (err) {
       console.error('Report konnte nicht gespeichert werden:', err);
     }
@@ -287,6 +431,28 @@ io.on('connection', (socket) => {
   });
 });
 
+// Vergleich der Online-Zeit mit den letzten 20 Solo-Solves des Spielers
+async function isSuspicious(userId, category, timeMs) {
+  if (timeMs >= DNF_MS) return false; // DNF ist nicht auffällig, sondern einfach ein DNF
+  if (timeMs < MIN_ONLINE_MS) return true;
+  try {
+    const { rows } = await pool.query(
+      `SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY time_ms) AS med
+         FROM (
+           SELECT time_ms FROM solves
+            WHERE user_id = $1 AND category = $2 AND NOT is_online AND time_ms < $3
+            ORDER BY solved_at DESC LIMIT 20
+         ) t`,
+      [userId, category, DNF_MS]
+    );
+    const med = rows[0]?.med == null ? null : Number(rows[0].med);
+    return med !== null && timeMs < med * PLAUSIBILITY_FACTOR;
+  } catch (err) {
+    console.error('Plausibilitätsprüfung fehlgeschlagen:', err);
+    return false; // im Zweifel nicht bestrafen
+  }
+}
+
 async function finishMatch(matchId) {
   const match = activeMatches.get(matchId);
   if (!match || match.finished) return;
@@ -298,32 +464,53 @@ async function finishMatch(matchId) {
   const winnerId = p1.timeMs <= p2.timeMs ? id1 : id2;
   const loserId = winnerId === id1 ? id2 : id1;
 
+  const suspicious = {
+    [id1]: await isSuspicious(id1, match.category, p1.timeMs),
+    [id2]: await isSuspicious(id2, match.category, p2.timeMs),
+  };
+  const flagged = suspicious[id1] || suspicious[id2];
+
   let ratingChanges = null;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    const { rows } = await client.query(
-      `SELECT id, rating FROM users WHERE id = ANY($1::uuid[]) FOR UPDATE`,
-      [[id1, id2]]
-    );
-    const rating = Object.fromEntries(rows.map((r) => [r.id, r.rating]));
-    const delta = eloDelta(rating[winnerId], rating[loserId]);
-    const newWinner = Math.max(RATING_FLOOR, rating[winnerId] + delta);
-    const newLoser = Math.max(RATING_FLOOR, rating[loserId] - delta);
+    if (!flagged) {
+      const { rows } = await client.query(
+        `SELECT id, rating FROM users WHERE id = ANY($1::uuid[]) FOR UPDATE`,
+        [[id1, id2]]
+      );
+      const rating = Object.fromEntries(rows.map((r) => [r.id, r.rating]));
+      const delta = eloDelta(rating[winnerId], rating[loserId]);
+      const newWinner = Math.max(RATING_FLOOR, rating[winnerId] + delta);
+      const newLoser = Math.max(RATING_FLOOR, rating[loserId] - delta);
 
-    // Rating aktualisieren; sauber gespielte Matches erhöhen den Trust Score langsam
-    await client.query(
-      `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
-      [winnerId, newWinner]
-    );
-    await client.query(
-      `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
-      [loserId, newLoser]
-    );
+      // Rating aktualisieren; sauber gespielte Matches erhöhen den Trust Score langsam
+      await client.query(
+        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
+        [winnerId, newWinner]
+      );
+      await client.query(
+        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
+        [loserId, newLoser]
+      );
+      ratingChanges = {
+        [winnerId]: { delta: newWinner - rating[winnerId], newRating: newWinner },
+        [loserId]: { delta: newLoser - rating[loserId], newRating: newLoser },
+      };
+    } else {
+      // Auffälliges Match: ungewertet, der auffällige Spieler verliert automatisch Trust
+      for (const id of [id1, id2]) {
+        if (!suspicious[id]) continue;
+        await client.query(
+          `UPDATE users SET trust_score = GREATEST(0, trust_score - $2) WHERE id = $1`,
+          [id, PLAUSIBILITY_TRUST_PENALTY]
+        );
+      }
+    }
 
     for (const [id, p] of [[id1, p1], [id2, p2]]) {
-      if (p.timeMs >= DNF_MS) continue; // DNF zählt nicht in die Solve-Statistik
+      if (p.timeMs >= DNF_MS || suspicious[id]) continue; // DNF und auffällige Zeiten zählen nicht
       await client.query(
         `INSERT INTO solves (user_id, category, time_ms, is_online, match_id)
          VALUES ($1, $2, $3, TRUE, $4)`,
@@ -333,17 +520,14 @@ async function finishMatch(matchId) {
 
     await client.query(
       `UPDATE matches
-          SET winner_id = $1, player1_time_ms = $2, player2_time_ms = $3, finished_at = now()
+          SET winner_id = $1, player1_time_ms = $2, player2_time_ms = $3, finished_at = now(), flagged = $5
         WHERE id = $4`,
-      [winnerId, p1.timeMs, p2.timeMs, matchId]
+      [winnerId, p1.timeMs, p2.timeMs, matchId, flagged]
     );
 
     await client.query('COMMIT');
-    ratingChanges = {
-      [winnerId]: { delta: newWinner - rating[winnerId], newRating: newWinner },
-      [loserId]: { delta: newLoser - rating[loserId], newRating: newLoser },
-    };
   } catch (err) {
+    ratingChanges = null;
     await client.query('ROLLBACK').catch(() => { });
     console.error('Match-Ergebnis konnte nicht gespeichert werden:', err);
   } finally {
@@ -356,6 +540,7 @@ async function finishMatch(matchId) {
       winnerId,
       times: { [id1]: p1.timeMs, [id2]: p2.timeMs },
       ratingChanges,
+      unrated: flagged,
     });
   }
 
