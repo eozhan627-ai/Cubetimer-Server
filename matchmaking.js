@@ -11,11 +11,11 @@ function getQueue(category) {
   return queues.get(category);
 }
 
-export function joinQueue({ socketId, userId, category, rating }) {
+export function joinQueue({ socketId, userId, category, rating, username }) {
   const queue = getQueue(category);
   // falls schon drin (Reconnect o.ä.), zuerst entfernen
   removeFromQueues(userId);
-  queue.push({ socketId, userId, rating, joinedAt: Date.now() });
+  queue.push({ socketId, userId, rating, username, joinedAt: Date.now() });
 }
 
 export function removeFromQueues(userId) {
