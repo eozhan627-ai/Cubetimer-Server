@@ -3,16 +3,18 @@ import http from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import fs from 'fs';
 import { Server } from 'socket.io';
-import { v4 as uuid } from 'uuid';
 import { pool } from './db.js';
 import { joinQueue, removeFromQueues, removeSocket, findMatches } from './matchmaking.js';
+import { generateScramble } from './scramble.js';
+import { DNF_MS, eloDelta, hasValidTime, pickWinner, createLimiter } from './rules.js';
 
 dotenv.config();
 
 const COUNTDOWN_MS = 3000;
-const DNF_MS = 999999999;
-const K_FACTOR = 32;
+const READY_TIMEOUT_MS = 60 * 1000; // so lange haben beide Zeit, "Bereit" zu drücken
+const MAX_MATCH_MS = 10 * 60 * 1000; // danach bekommt, wer noch nicht gestoppt hat, ein DNF
 const RATING_FLOOR = 100;
 const MATCH_KEEP_MS = 10 * 60 * 1000; // so lange kann ein Match noch gemeldet werden
 
@@ -45,14 +47,24 @@ const isUuid = (v) =>
   typeof v === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
 
-function eloDelta(winnerRating, loserRating) {
-  const expected = 1 / (1 + Math.pow(10, (loserRating - winnerRating) / 400));
-  return Math.round(K_FACTOR * (1 - expected));
-}
+const USERNAME_RE = /^[A-Za-z0-9_]{3,20}$/;
 
 const app = express();
+app.set('trust proxy', 1); // hinter dem Render-Proxy, sonst hätten alle Clients dieselbe IP
 app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
+
+// --- Rate-Limits: verhindert, dass jemand massenhaft Konten anlegt oder die DB flutet ---
+function rateLimit(options, keyOf = (req) => req.ip) {
+  const allow = createLimiter(options);
+  return (req, res, next) => {
+    if (allow(keyOf(req))) return next();
+    res.status(429).json({ error: 'too_many_requests' });
+  };
+}
+const generalLimit = rateLimit({ windowMs: 60 * 1000, max: 300 });
+const registerLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 10 });
+const renameLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 5 }, (req) => req.userId);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
@@ -90,9 +102,9 @@ async function countValidSolo(userId, category) {
 }
 
 // --- Anonyme Konten: Gerät registriert sich einmal, bekommt userId + geheimen Token ---
-app.post('/register', async (req, res) => {
+app.post('/register', registerLimit, async (req, res) => {
   const username = String(req.body?.username ?? '').trim();
-  if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+  if (!USERNAME_RE.test(username)) {
     return res.status(400).json({ error: 'invalid_username' });
   }
   const token = crypto.randomBytes(24).toString('hex');
@@ -109,8 +121,22 @@ app.post('/register', async (req, res) => {
   }
 });
 
+// --- Benutzernamen ändern ---
+app.post('/username', requireAuth, renameLimit, async (req, res) => {
+  const username = String(req.body?.username ?? '').trim();
+  if (!USERNAME_RE.test(username)) return res.status(400).json({ error: 'invalid_username' });
+  try {
+    await pool.query(`UPDATE users SET username = $2 WHERE id = $1`, [req.userId, username]);
+    res.json({ username });
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'username_taken' });
+    console.error('Umbenennen fehlgeschlagen:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
 // --- Solo-Solve hochladen (Vergleichsbasis für die Plausibilitätsprüfung) ---
-app.post('/solves', requireAuth, async (req, res) => {
+app.post('/solves', generalLimit, requireAuth, async (req, res) => {
   const { category, timeMs, solvedAt } = req.body ?? {};
   if (
     !SOLO_CATEGORIES.has(category) ||
@@ -138,7 +164,7 @@ app.post('/solves', requireAuth, async (req, res) => {
 });
 
 // --- Darf der Spieler online spielen? (für die Anzeige "12/20") ---
-app.get('/eligibility', requireAuth, async (req, res) => {
+app.get('/eligibility', generalLimit, requireAuth, async (req, res) => {
   const category = String(req.query.category ?? '');
   if (!ONLINE_CATEGORIES.includes(category)) return res.status(400).json({ error: 'bad_category' });
   try {
@@ -155,7 +181,7 @@ app.get('/eligibility', requireAuth, async (req, res) => {
 });
 
 // --- Profil (öffentlich lesbar über die nicht erratbare UUID, ohne geheime Felder) ---
-app.get('/profile/:userId', async (req, res) => {
+app.get('/profile/:userId', generalLimit, async (req, res) => {
   const { userId } = req.params;
   if (!isUuid(userId)) return res.status(400).json({ error: 'invalid_id' });
   try {
@@ -239,13 +265,17 @@ app.post('/admin/reports/:id/resolve', async (req, res) => {
   }
 });
 
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: process.env.CLIENT_ORIGIN || '*' },
+  maxHttpBufferSize: 100 * 1024, // die Events sind winzig – große Pakete braucht niemand
 });
 
-// matchId -> { category, players: { [userId]: { socketId, ready, stoppedAt, timeMs } }, startAt, finished }
+// matchId -> { category, scramble, players: { [userId]: { socketId, ready, stoppedAt, timeMs, forfeit } }, startAt, finished, timer }
 const activeMatches = new Map();
+// userId -> matchId, solange das Match läuft (verhindert doppeltes Anstellen und macht den Disconnect billig)
+const userMatch = new Map();
 
 // --- Socket-Authentifizierung: userId + Token müssen zusammenpassen ---
 io.use(async (socket, next) => {
@@ -290,6 +320,39 @@ async function checkReportCluster(reportedId) {
   }
 }
 
+function clearMatchTimer(match) {
+  if (match.timer) clearTimeout(match.timer);
+  match.timer = null;
+}
+
+// Match ohne Wertung beenden (vor dem Start: jemand ist weg oder bestätigt nicht)
+function abortMatch(matchId, reason) {
+  const match = activeMatches.get(matchId);
+  if (!match || match.finished) return;
+  match.finished = true;
+  clearMatchTimer(match);
+  for (const [id, p] of Object.entries(match.players)) {
+    userMatch.delete(id);
+    io.to(p.socketId).emit('match:aborted', { matchId, reason });
+  }
+  pool
+    .query(`DELETE FROM matches WHERE id = $1 AND finished_at IS NULL`, [matchId])
+    .catch((err) => console.error('Abgebrochenes Match nicht gelöscht:', err));
+  activeMatches.delete(matchId);
+}
+
+// Niemand darf ein Match ewig offen halten: wer nach MAX_MATCH_MS nicht gestoppt hat, bekommt ein DNF
+function timeoutMatch(matchId) {
+  const match = activeMatches.get(matchId);
+  if (!match || match.finished) return;
+  for (const p of Object.values(match.players)) {
+    if (p.stoppedAt) continue;
+    p.stoppedAt = Date.now();
+    p.timeMs = DNF_MS;
+  }
+  finishMatch(matchId).catch((err) => console.error('finishMatch fehlgeschlagen:', err));
+}
+
 io.on('connection', (socket) => {
   // --- Matchmaking: Rating kommt aus der DB, nicht vom Client ---
   socket.on('queue:join', async ({ category } = {}) => {
@@ -300,6 +363,7 @@ io.on('connection', (socket) => {
       socket.emit('queue:denied', { reason: 'category_unavailable' });
       return;
     }
+    if (userMatch.has(userId)) return; // steckt noch in einem laufenden Match
 
     try {
       const { rows } = await pool.query(
@@ -320,6 +384,9 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // Während der DB-Abfragen kann die Verbindung weg oder ein Match entstanden sein
+      if (!socket.connected || userMatch.has(userId)) return;
+
       joinQueue({
         socketId: socket.id,
         userId,
@@ -329,6 +396,7 @@ io.on('connection', (socket) => {
       });
     } catch (err) {
       console.error('queue:join fehlgeschlagen:', err);
+      socket.emit('queue:denied', { reason: 'server_error' });
     }
   });
 
@@ -339,12 +407,14 @@ io.on('connection', (socket) => {
     const match = activeMatches.get(matchId);
     if (!match || match.finished) return;
     const player = match.players[socket.data.userId];
-    if (!player) return;
+    if (!player || player.socketId !== socket.id) return;
     player.ready = true;
 
     const allReady = Object.values(match.players).every((p) => p.ready);
     if (allReady && !match.startAt) {
+      clearMatchTimer(match);
       match.startAt = Date.now() + COUNTDOWN_MS;
+      match.timer = setTimeout(() => timeoutMatch(matchId), COUNTDOWN_MS + MAX_MATCH_MS);
       // countdownMs statt absoluter Uhrzeit: die Handy-Uhr muss nicht mit der Server-Uhr übereinstimmen
       for (const p of Object.values(match.players)) {
         io.to(p.socketId).emit('match:countdown', { matchId, countdownMs: COUNTDOWN_MS });
@@ -359,7 +429,7 @@ io.on('connection', (socket) => {
 
     const userId = socket.data.userId;
     const player = match.players[userId];
-    if (!player || player.stoppedAt) return;
+    if (!player || player.socketId !== socket.id || player.stoppedAt) return;
 
     const now = Date.now();
     player.stoppedAt = now;
@@ -368,7 +438,7 @@ io.on('connection', (socket) => {
 
     const allStopped = Object.values(match.players).every((p) => p.stoppedAt);
     if (allStopped) {
-      finishMatch(matchId);
+      finishMatch(matchId).catch((err) => console.error('finishMatch fehlgeschlagen:', err));
     } else {
       for (const p of Object.values(match.players)) {
         if (p.socketId !== socket.id) io.to(p.socketId).emit('match:opponent-stopped');
@@ -379,7 +449,7 @@ io.on('connection', (socket) => {
   // --- WebRTC-Signaling (für Phase 2, aktuell ungenutzt) ---
   socket.on('webrtc:signal', ({ matchId, targetUserId, data } = {}) => {
     const match = activeMatches.get(matchId);
-    if (!match || !match.players[socket.data.userId]) return;
+    if (!match || match.finished || !match.players[socket.data.userId]) return;
     const target = match.players[targetUserId];
     if (target) {
       io.to(target.socketId).emit('webrtc:signal', { fromUserId: socket.data.userId, data });
@@ -412,28 +482,31 @@ io.on('connection', (socket) => {
 
   socket.on('disconnect', () => {
     const userId = socket.data.userId;
-    removeFromQueues(userId);
-    removeSocket(socket.id);
+    removeSocket(socket.id); // nur diese Verbindung – ein zweites Gerät desselben Kontos bleibt in der Queue
 
-    // Laufendes Match abbrechen, damit der Gegner nicht ewig wartet (ohne Rating-Änderung)
-    for (const [matchId, match] of activeMatches) {
-      const me = match.players[userId];
-      if (!me || me.socketId !== socket.id || match.finished) continue;
-      match.finished = true;
-      for (const [id, p] of Object.entries(match.players)) {
-        if (id !== userId) io.to(p.socketId).emit('match:aborted', { matchId });
-      }
-      pool
-        .query(`DELETE FROM matches WHERE id = $1 AND finished_at IS NULL`, [matchId])
-        .catch((err) => console.error('Abgebrochenes Match nicht gelöscht:', err));
-      activeMatches.delete(matchId);
+    const matchId = userMatch.get(userId);
+    const match = matchId ? activeMatches.get(matchId) : null;
+    const me = match?.players[userId];
+    if (!match || match.finished || !me || me.socketId !== socket.id) return;
+
+    if (!match.startAt) {
+      // Noch nicht gestartet: ohne Wertung abbrechen, damit der Gegner nicht ewig wartet
+      abortMatch(matchId, 'opponent_left');
+    } else if (!me.stoppedAt) {
+      // Nach dem Start zählt Verlassen als Aufgabe. Sonst könnte man jede drohende
+      // Niederlage einfach durch Schließen der App ungeschehen machen.
+      me.forfeit = true;
+      me.stoppedAt = Date.now();
+      me.timeMs = DNF_MS;
+      finishMatch(matchId).catch((err) => console.error('finishMatch fehlgeschlagen:', err));
     }
+    // Wer schon gestoppt hat und dann geht, bekommt sein Ergebnis ganz normal gewertet.
   });
 });
 
 // Vergleich der Online-Zeit mit den letzten 20 Solo-Solves des Spielers
 async function isSuspicious(userId, category, timeMs) {
-  if (timeMs >= DNF_MS) return false; // DNF ist nicht auffällig, sondern einfach ein DNF
+  if (!Number.isInteger(timeMs) || timeMs >= DNF_MS) return false; // DNF ist nicht auffällig, sondern einfach ein DNF
   if (timeMs < MIN_ONLINE_MS) return true;
   try {
     const { rows } = await pool.query(
@@ -457,48 +530,34 @@ async function finishMatch(matchId) {
   const match = activeMatches.get(matchId);
   if (!match || match.finished) return;
   match.finished = true;
+  clearMatchTimer(match);
 
   const [id1, id2] = Object.keys(match.players); // Reihenfolge = player1, player2 aus der Match-Erstellung
   const p1 = match.players[id1];
   const p2 = match.players[id2];
-  const winnerId = p1.timeMs <= p2.timeMs ? id1 : id2;
-  const loserId = winnerId === id1 ? id2 : id1;
+  userMatch.delete(id1);
+  userMatch.delete(id2);
 
-  const suspicious = {
-    [id1]: await isSuspicious(id1, match.category, p1.timeMs),
-    [id2]: await isSuspicious(id2, match.category, p2.timeMs),
-  };
-  const flagged = suspicious[id1] || suspicious[id2];
+  const winnerId = pickWinner(id1, p1, id2, p2);
+  const loserId = winnerId === null ? null : winnerId === id1 ? id2 : id1;
+  const time1 = Number.isInteger(p1.timeMs) ? p1.timeMs : null; // null = hat nie gestoppt
+  const time2 = Number.isInteger(p2.timeMs) ? p2.timeMs : null;
 
   let ratingChanges = null;
-  const client = await pool.connect();
+  let flagged = false;
+  let client = null;
   try {
+    const suspicious = {
+      [id1]: await isSuspicious(id1, match.category, time1),
+      [id2]: await isSuspicious(id2, match.category, time2),
+    };
+    flagged = suspicious[id1] || suspicious[id2];
+
+    client = await pool.connect();
     await client.query('BEGIN');
 
-    if (!flagged) {
-      const { rows } = await client.query(
-        `SELECT id, rating FROM users WHERE id = ANY($1::uuid[]) FOR UPDATE`,
-        [[id1, id2]]
-      );
-      const rating = Object.fromEntries(rows.map((r) => [r.id, r.rating]));
-      const delta = eloDelta(rating[winnerId], rating[loserId]);
-      const newWinner = Math.max(RATING_FLOOR, rating[winnerId] + delta);
-      const newLoser = Math.max(RATING_FLOOR, rating[loserId] - delta);
-
-      // Rating aktualisieren; sauber gespielte Matches erhöhen den Trust Score langsam
-      await client.query(
-        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
-        [winnerId, newWinner]
-      );
-      await client.query(
-        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
-        [loserId, newLoser]
-      );
-      ratingChanges = {
-        [winnerId]: { delta: newWinner - rating[winnerId], newRating: newWinner },
-        [loserId]: { delta: newLoser - rating[loserId], newRating: newLoser },
-      };
-    } else {
+    let changes = null;
+    if (flagged) {
       // Auffälliges Match: ungewertet, der auffällige Spieler verliert automatisch Trust
       for (const id of [id1, id2]) {
         if (!suspicious[id]) continue;
@@ -507,10 +566,34 @@ async function finishMatch(matchId) {
           [id, PLAUSIBILITY_TRUST_PENALTY]
         );
       }
+    } else if (winnerId !== null) {
+      const { rows } = await client.query(
+        `SELECT id, rating FROM users WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
+        [[id1, id2]]
+      );
+      const rating = Object.fromEntries(rows.map((r) => [r.id, r.rating]));
+      const delta = eloDelta(rating[winnerId], rating[loserId]);
+      const newWinner = Math.max(RATING_FLOOR, rating[winnerId] + delta);
+      const newLoser = Math.max(RATING_FLOOR, rating[loserId] - delta);
+
+      // Rating aktualisieren; sauber gespielte Matches erhöhen den Trust Score langsam.
+      // Wer aufgibt, bekommt den Bonus nicht.
+      await client.query(
+        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + 1) WHERE id = $1`,
+        [winnerId, newWinner]
+      );
+      await client.query(
+        `UPDATE users SET rating = $2, trust_score = LEAST(100, trust_score + $3) WHERE id = $1`,
+        [loserId, newLoser, match.players[loserId].forfeit ? 0 : 1]
+      );
+      changes = {
+        [winnerId]: { delta: newWinner - rating[winnerId], newRating: newWinner },
+        [loserId]: { delta: newLoser - rating[loserId], newRating: newLoser },
+      };
     }
 
     for (const [id, p] of [[id1, p1], [id2, p2]]) {
-      if (p.timeMs >= DNF_MS || suspicious[id]) continue; // DNF und auffällige Zeiten zählen nicht
+      if (!hasValidTime(p) || suspicious[id]) continue; // DNF und auffällige Zeiten zählen nicht
       await client.query(
         `INSERT INTO solves (user_id, category, time_ms, is_online, match_id)
          VALUES ($1, $2, $3, TRUE, $4)`,
@@ -522,40 +605,51 @@ async function finishMatch(matchId) {
       `UPDATE matches
           SET winner_id = $1, player1_time_ms = $2, player2_time_ms = $3, finished_at = now(), flagged = $5
         WHERE id = $4`,
-      [winnerId, p1.timeMs, p2.timeMs, matchId, flagged]
+      [winnerId, time1, time2, matchId, flagged]
     );
 
     await client.query('COMMIT');
+    ratingChanges = changes; // erst nach dem COMMIT gilt die Wertung
   } catch (err) {
-    ratingChanges = null;
-    await client.query('ROLLBACK').catch(() => { });
+    if (client) await client.query('ROLLBACK').catch(() => { });
     console.error('Match-Ergebnis konnte nicht gespeichert werden:', err);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 
   for (const p of Object.values(match.players)) {
     io.to(p.socketId).emit('match:result', {
       matchId,
       winnerId,
-      times: { [id1]: p1.timeMs, [id2]: p2.timeMs },
+      times: { [id1]: time1, [id2]: time2 },
+      forfeit: { [id1]: !!p1.forfeit, [id2]: !!p2.forfeit },
       ratingChanges,
-      unrated: flagged,
+      unrated: ratingChanges === null,
+      flagged,
     });
   }
 
   // Match noch eine Weile im Speicher lassen, damit Reports möglich bleiben
-  setTimeout(() => activeMatches.delete(matchId), MATCH_KEEP_MS);
+  setTimeout(() => activeMatches.delete(matchId), MATCH_KEEP_MS).unref();
 }
 
 // Matchmaking-Loop: prüft jede Sekunde auf passende Paare
 let matching = false;
-setInterval(async () => {
+const matchLoop = setInterval(async () => {
   if (matching) return;
   matching = true;
   try {
     for (const { category, player1, player2 } of findMatches()) {
-      const matchId = uuid();
+      // Wer inzwischen weg ist oder schon spielt, wird nicht gematcht; der andere wartet weiter
+      const ok1 = io.sockets.sockets.has(player1.socketId) && !userMatch.has(player1.userId);
+      const ok2 = io.sockets.sockets.has(player2.socketId) && !userMatch.has(player2.userId);
+      if (!ok1 || !ok2 || player1.userId === player2.userId) {
+        if (ok1) joinQueue({ ...player1, category });
+        else if (ok2) joinQueue({ ...player2, category });
+        continue;
+      }
+
+      const matchId = crypto.randomUUID();
 
       try {
         await pool.query(
@@ -570,35 +664,71 @@ setInterval(async () => {
         continue;
       }
 
+      const scramble = generateScramble(category);
       activeMatches.set(matchId, {
         category,
+        scramble,
         players: {
           [player1.userId]: { socketId: player1.socketId, ready: false },
           [player2.userId]: { socketId: player2.socketId, ready: false },
         },
         startAt: null,
         finished: false,
+        // bestätigt jemand nicht, hängt der andere sonst für immer im "Bereit"-Bildschirm
+        timer: setTimeout(() => abortMatch(matchId, 'ready_timeout'), READY_TIMEOUT_MS),
       });
+      userMatch.set(player1.userId, matchId);
+      userMatch.set(player2.userId, matchId);
 
-      io.to(player1.socketId).emit('match:found', {
-        matchId,
-        category,
-        opponentUserId: player2.userId,
-        opponentName: player2.username,
-        opponentRating: player2.rating,
-      });
-      io.to(player2.socketId).emit('match:found', {
-        matchId,
-        category,
-        opponentUserId: player1.userId,
-        opponentName: player1.username,
-        opponentRating: player1.rating,
-      });
+      for (const [me, other] of [[player1, player2], [player2, player1]]) {
+        io.to(me.socketId).emit('match:found', {
+          matchId,
+          category,
+          scramble,
+          readyTimeoutMs: READY_TIMEOUT_MS,
+          opponentUserId: other.userId,
+          opponentName: other.username,
+          opponentRating: other.rating,
+        });
+      }
     }
+  } catch (err) {
+    console.error('Matchmaking-Loop fehlgeschlagen:', err);
   } finally {
     matching = false;
   }
 }, 1000);
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`cube-timer-server läuft auf Port ${PORT}`));
+process.on('unhandledRejection', (err) => console.error('Unbehandelter Fehler:', err));
+
+async function start() {
+  // Datenbank-Schema beim Start anlegen bzw. ergänzen. db/schema.sql ist wiederholbar
+  // und löscht nichts – dadurch muss niemand das SQL von Hand ausführen.
+  try {
+    const schema = fs.readFileSync(new URL('./db/schema.sql', import.meta.url), 'utf8');
+    await pool.query(schema);
+    console.log('Datenbank-Schema ist aktuell.');
+  } catch (err) {
+    console.error('Datenbank-Schema konnte nicht angewendet werden:', err);
+  }
+  // Matches, die ein früherer Prozess nicht mehr beenden konnte (Neustart/Deploy), sind verloren
+  try {
+    await pool.query(`DELETE FROM matches WHERE finished_at IS NULL`);
+  } catch (err) {
+    console.error('Aufräumen offener Matches fehlgeschlagen:', err);
+  }
+  const PORT = process.env.PORT || 4000;
+  server.listen(PORT, () => console.log(`cube-timer-server läuft auf Port ${PORT}`));
+}
+
+// Sauber herunterfahren, damit Render beim Deploy keine halben Transaktionen abschneidet
+function shutdown() {
+  clearInterval(matchLoop);
+  for (const matchId of [...activeMatches.keys()]) abortMatch(matchId, 'server_restart');
+  io.close(() => pool.end().finally(() => process.exit(0)));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+start();
