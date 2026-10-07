@@ -35,7 +35,6 @@ BEGIN
     ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
   END IF;
 END $$;
-
 -- ---------- matches ----------
 CREATE TABLE IF NOT EXISTS matches (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
