@@ -64,6 +64,7 @@ function rateLimit(options, keyOf = (req) => req.ip) {
 }
 const generalLimit = rateLimit({ windowMs: 60 * 1000, max: 300 });
 const registerLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 10 });
+const recoverLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 10 });
 const renameLimit = rateLimit({ windowMs: 60 * 60 * 1000, max: 5 }, (req) => req.userId);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -117,6 +118,116 @@ app.post('/register', registerLimit, async (req, res) => {
   } catch (err) {
     if (err.code === '23505') return res.status(409).json({ error: 'username_taken' });
     console.error('Registrierung fehlgeschlagen:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// --- Kontosicherung: Wiederherstellungscode ---
+// Der Code wird nur einmal angezeigt und nur als Hash gespeichert. Ein neuer Code ersetzt den alten.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // ohne leicht verwechselbare Zeichen (0/O, 1/I/L)
+const normalizeCode = (v) => String(v ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+
+app.post('/recovery-code', requireAuth, renameLimit, async (req, res) => {
+  let code = '';
+  for (let i = 0; i < 16; i++) code += CODE_ALPHABET[crypto.randomInt(CODE_ALPHABET.length)];
+  try {
+    await pool.query(`UPDATE users SET recovery_code_hash = $2 WHERE id = $1`, [req.userId, hashToken(code)]);
+    res.json({ code: code.match(/.{4}/g).join('-') });
+  } catch (err) {
+    console.error('Wiederherstellungscode konnte nicht erstellt werden:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// Konto auf einem neuen Gerät übernehmen. Das alte Gerät verliert dabei den Zugang (neuer Token).
+app.post('/recover', recoverLimit, async (req, res) => {
+  const username = String(req.body?.username ?? '').trim();
+  const code = normalizeCode(req.body?.code);
+  if (!USERNAME_RE.test(username) || code.length !== 16) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+  const token = crypto.randomBytes(24).toString('hex');
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET auth_token_hash = $3
+        WHERE lower(username) = lower($1) AND recovery_code_hash = $2
+        RETURNING id, username`,
+      [username, hashToken(code), hashToken(token)]
+    );
+    if (rows.length !== 1) return res.status(404).json({ error: 'not_found' });
+    res.json({ userId: rows[0].id, token, username: rows[0].username });
+  } catch (err) {
+    console.error('Wiederherstellung fehlgeschlagen:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// --- Rangliste: nur wer schon online gespielt hat ---
+app.get('/leaderboard', generalLimit, requireAuth, async (req, res) => {
+  try {
+    const top = await pool.query(
+      `SELECT id, username, rating, is_vip, matches_played, wins
+         FROM users WHERE matches_played > 0
+        ORDER BY rating DESC, created_at ASC LIMIT 50`
+    );
+    const me = await pool.query(
+      `SELECT u.rating, u.matches_played,
+              (SELECT COUNT(*)::int FROM users o WHERE o.matches_played > 0 AND o.rating > u.rating) + 1 AS rank
+         FROM users u WHERE u.id = $1`,
+      [req.userId]
+    );
+    const m = me.rows[0];
+    res.json({
+      top: top.rows.map((r, i) => ({
+        rank: i + 1,
+        username: r.username,
+        rating: r.rating,
+        isVip: r.is_vip,
+        matches: r.matches_played,
+        wins: r.wins,
+        isMe: r.id === req.userId,
+      })),
+      me: m && m.matches_played > 0 ? { rank: m.rank, rating: m.rating } : null,
+    });
+  } catch (err) {
+    console.error('Rangliste konnte nicht geladen werden:', err);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+// --- Eigene letzte Matches ---
+app.get('/matches', generalLimit, requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT m.id, m.category, m.finished_at, m.winner_id, m.flagged,
+              m.player1_id, m.player1_time_ms, m.player2_time_ms,
+              m.player1_rating_delta, m.player2_rating_delta,
+              u1.username AS p1_name, u2.username AS p2_name
+         FROM matches m
+         JOIN users u1 ON u1.id = m.player1_id
+         JOIN users u2 ON u2.id = m.player2_id
+        WHERE (m.player1_id = $1 OR m.player2_id = $1) AND m.finished_at IS NOT NULL
+        ORDER BY m.finished_at DESC LIMIT 20`,
+      [req.userId]
+    );
+    res.json({
+      matches: rows.map((r) => {
+        const first = r.player1_id === req.userId;
+        return {
+          id: r.id,
+          category: r.category,
+          finishedAt: r.finished_at,
+          outcome: r.winner_id === null ? 'draw' : r.winner_id === req.userId ? 'won' : 'lost',
+          myTime: first ? r.player1_time_ms : r.player2_time_ms,
+          opponentTime: first ? r.player2_time_ms : r.player1_time_ms,
+          opponentName: first ? r.p2_name : r.p1_name,
+          ratingDelta: first ? r.player1_rating_delta : r.player2_rating_delta,
+          flagged: r.flagged,
+        };
+      }),
+    });
+  } catch (err) {
+    console.error('Matches konnten nicht geladen werden:', err);
     res.status(500).json({ error: 'server_error' });
   }
 });
@@ -186,7 +297,7 @@ app.get('/profile/:userId', generalLimit, async (req, res) => {
   if (!isUuid(userId)) return res.status(400).json({ error: 'invalid_id' });
   try {
     const user = await pool.query(
-      `SELECT username, rating, trust_score, is_vip, created_at FROM users WHERE id = $1`,
+      `SELECT username, rating, trust_score, is_vip, created_at, matches_played, wins, recovery_code_hash IS NOT NULL AS has_recovery FROM users WHERE id = $1`,
       [userId]
     );
     if (user.rowCount === 0) return res.status(404).json({ error: 'not_found' });
@@ -204,6 +315,9 @@ app.get('/profile/:userId', generalLimit, async (req, res) => {
       trustScore: u.trust_score,
       isVip: u.is_vip,
       createdAt: u.created_at,
+      matches: u.matches_played,
+      wins: u.wins,
+      hasRecoveryCode: u.has_recovery,
       onlineSolves: cats.rows.reduce((sum, r) => sum + r.count, 0),
       byCategory: cats.rows,
     });
@@ -603,10 +717,21 @@ async function finishMatch(matchId) {
 
     await client.query(
       `UPDATE matches
-          SET winner_id = $1, player1_time_ms = $2, player2_time_ms = $3, finished_at = now(), flagged = $5
+          SET winner_id = $1, player1_time_ms = $2, player2_time_ms = $3, finished_at = now(), flagged = $5,
+              player1_rating_delta = $6, player2_rating_delta = $7
         WHERE id = $4`,
-      [winnerId, time1, time2, matchId, flagged]
+      [winnerId, time1, time2, matchId, flagged, changes?.[id1]?.delta ?? null, changes?.[id2]?.delta ?? null]
     );
+
+    // Zähler für Profil und Rangliste (nur gewertete Matches)
+    if (changes) {
+      await client.query(
+        `UPDATE users SET matches_played = matches_played + 1,
+                          wins = wins + CASE WHEN id = $2 THEN 1 ELSE 0 END
+          WHERE id = ANY($1::uuid[])`,
+        [[id1, id2], winnerId]
+      );
+    }
 
     await client.query('COMMIT');
     ratingChanges = changes; // erst nach dem COMMIT gilt die Wertung
